@@ -86,6 +86,28 @@ bash scripts/upgrade-guard.sh rollback
 
 Best used together: config-guard for config edits, upgrade-guard for version upgrades.
 
+## Watchdog — OS-Level Self-Healing
+
+The real "fix it without you" piece. Runs as a systemd timer, independent of the AI agent and gateway.
+
+```bash
+# Install (checks every 60 seconds)
+bash scripts/watchdog.sh install
+
+# Manual check
+bash scripts/watchdog.sh check
+
+# Status
+bash scripts/watchdog.sh status
+```
+
+**Recovery strategy:**
+- Failures 1-2 → log and wait
+- Failure 3 → restart gateway
+- Failure 6+ → full rollback to last snapshot
+
+**Survives:** gateway crash, AI agent death, server reboots.
+
 ## Requirements
 
 - `bash` 4+, `python3`, `curl`, `git`, `pnpm` or `npm`

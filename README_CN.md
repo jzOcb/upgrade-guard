@@ -86,6 +86,28 @@ bash scripts/upgrade-guard.sh rollback
 
 最佳搭配：改配置用 config-guard，升级版本用 upgrade-guard。
 
+## Watchdog — 操作系统级自愈
+
+真正的"不需要你介入"。通过 systemd timer 运行，完全独立于 AI agent 和网关。
+
+```bash
+# 安装（每60秒检查一次）
+bash scripts/watchdog.sh install
+
+# 手动检查
+bash scripts/watchdog.sh check
+
+# 查看状态
+bash scripts/watchdog.sh status
+```
+
+**恢复策略：**
+- 失败 1-2 次 → 记录等待
+- 失败 3 次 → 重启网关
+- 失败 6+ 次 → 完整回滚到上一个快照
+
+**不怕：** 网关崩溃、AI agent 挂了、服务器重启。
+
 ## 依赖
 
 - `bash` 4+, `python3`, `curl`, `git`, `pnpm` 或 `npm`
