@@ -297,11 +297,16 @@ cmd_upgrade() {
   fi
   echo ""
 
+  # Remember old version for final message
+  local old_version
+  old_version=$(cat "$STATE_DIR/latest/version" 2>/dev/null || echo "unknown")
+
   # Step 4: git pull
   info "━━━ Step 4/6: git pull ━━━"
   (cd "$OPENCLAW_DIR" && git pull origin main 2>&1) || {
     fail "git pull failed!"
-    warn "You can rollback with: upgrade-guard.sh rollback"
+    warn "⚡ AUTO-ROLLBACK: restoring previous version..."
+    cmd_rollback
     return 1
   }
   local new_version
@@ -313,13 +318,8 @@ cmd_upgrade() {
   info "━━━ Step 5/6: Install dependencies + build ━━━"
   (cd "$OPENCLAW_DIR" && pnpm install 2>&1) || {
     fail "pnpm install failed!"
-    warn "Rolling back git..."
-    local old_commit
-    old_commit=$(cat "$STATE_DIR/latest/git-commit" 2>/dev/null)
-    if [[ -n "$old_commit" ]]; then
-      (cd "$OPENCLAW_DIR" && git checkout "$old_commit" 2>&1)
-      (cd "$OPENCLAW_DIR" && pnpm install 2>&1)
-    fi
+    warn "⚡ AUTO-ROLLBACK: restoring previous version..."
+    cmd_rollback
     return 1
   }
   ok "Dependencies installed"
@@ -327,7 +327,7 @@ cmd_upgrade() {
   if [[ -f "$OPENCLAW_DIR/package.json" ]] && grep -q '"build"' "$OPENCLAW_DIR/package.json"; then
     (cd "$OPENCLAW_DIR" && pnpm run build 2>&1) || {
       fail "Build failed!"
-      warn "Rolling back..."
+      warn "⚡ AUTO-ROLLBACK: restoring previous version..."
       cmd_rollback
       return 1
     }
@@ -335,9 +335,43 @@ cmd_upgrade() {
   fi
   echo ""
 
-  # Step 6: Post-upgrade verification
-  info "━━━ Step 6/6: Post-upgrade verification ━━━"
-  cmd_verify
+  # Step 6: Start gateway and verify
+  info "━━━ Step 6/6: Start gateway + auto-verify ━━━"
+  
+  # Start gateway
+  info "Starting gateway..."
+  openclaw gateway start 2>/dev/null &
+  
+  # Wait for gateway to respond
+  local gw_ok=false
+  for i in $(seq 1 45); do
+    if curl -sf "${GATEWAY_URL}/healthz" >/dev/null 2>&1 || curl -sf "${GATEWAY_URL}/api/health" >/dev/null 2>&1; then
+      gw_ok=true
+      break
+    fi
+    # Also check if process died already (no point waiting)
+    if [[ $i -gt 10 ]] && ! pgrep -f "openclaw\|clawdbot" >/dev/null 2>&1; then
+      fail "Gateway process died!"
+      break
+    fi
+    sleep 1
+  done
+
+  if $gw_ok; then
+    ok "Gateway is up and responding ✅"
+    echo ""
+    ok "🎉 Upgrade successful! $old_version → $new_version"
+  else
+    # === AUTO-ROLLBACK ===
+    fail "❌ Gateway failed to start after upgrade!"
+    warn "⚡ AUTO-ROLLBACK: restoring previous version..."
+    echo ""
+    cmd_rollback
+    echo ""
+    fail "Upgrade failed. System rolled back to v$(cat "$STATE_DIR/latest/version" 2>/dev/null || echo '?')"
+    fail "Check logs to diagnose what went wrong before retrying."
+    return 1
+  fi
 }
 
 # ============================================================
