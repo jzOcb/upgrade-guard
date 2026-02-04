@@ -316,82 +316,132 @@ log_event() {
 cmd_install() {
   local script_path
   script_path=$(realpath "$0")
-  local service_dir="$HOME/.config/systemd/user"
-  mkdir -p "$service_dir"
 
-  # Check if we need system-level (since clawdbot.service is system-level)
-  local use_system=false
-  if systemctl status clawdbot.service >/dev/null 2>&1; then
-    info "clawdbot.service is system-level"
-    if [[ $EUID -eq 0 ]]; then
-      use_system=true
-      service_dir="/etc/systemd/system"
-    else
-      info "Using user-level timer (will need 'loginctl enable-linger clawdbot')"
-    fi
+  # Strategy: try systemd first, fall back to cron
+  local installed=false
+
+  # Try system-level systemd (needs root)
+  if [[ $EUID -eq 0 ]]; then
+    _install_systemd_system "$script_path"
+    installed=true
   fi
 
-  # Service file
+  # Try user-level systemd (needs dbus)
+  if ! $installed && systemctl --user status >/dev/null 2>&1; then
+    _install_systemd_user "$script_path"
+    installed=true
+  fi
+
+  # Fall back to cron
+  if ! $installed; then
+    _install_cron "$script_path"
+    installed=true
+  fi
+}
+
+_install_systemd_system() {
+  local script_path="$1"
+  local service_dir="/etc/systemd/system"
+
   cat > "$service_dir/openclaw-watchdog.service" <<EOF
 [Unit]
 Description=OpenClaw Gateway Watchdog
 After=network.target
-
 [Service]
 Type=oneshot
 User=clawdbot
 Group=clawdbot
 Environment="HOME=/home/clawdbot"
 Environment="PATH=/home/clawdbot/.npm/bin:/home/clawdbot/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="GATEWAY_PORT=${GATEWAY_PORT}"
 ExecStart=/usr/bin/bash ${script_path} check
 StandardOutput=journal
 StandardError=journal
 EOF
 
-  # Timer file (every 60 seconds)
   cat > "$service_dir/openclaw-watchdog.timer" <<EOF
 [Unit]
 Description=OpenClaw Gateway Watchdog Timer
-
 [Timer]
 OnBootSec=120
 OnUnitActiveSec=60
 AccuracySec=10
-
 [Install]
 WantedBy=timers.target
 EOF
 
-  if $use_system; then
-    systemctl daemon-reload
-    systemctl enable openclaw-watchdog.timer
-    systemctl start openclaw-watchdog.timer
-  else
-    systemctl --user daemon-reload
-    systemctl --user enable openclaw-watchdog.timer
-    systemctl --user start openclaw-watchdog.timer
-    # Enable linger so timer runs without login
-    loginctl enable-linger clawdbot 2>/dev/null || warn "Run 'sudo loginctl enable-linger clawdbot' for timer to persist"
-  fi
+  systemctl daemon-reload
+  systemctl enable openclaw-watchdog.timer
+  systemctl start openclaw-watchdog.timer
+  ok "Watchdog installed (systemd system timer, every 60s)"
+  info "View logs: journalctl -u openclaw-watchdog.service"
+}
 
-  ok "Watchdog timer installed (checks every 60s)"
-  ok "Service: $service_dir/openclaw-watchdog.service"
-  ok "Timer: $service_dir/openclaw-watchdog.timer"
+_install_systemd_user() {
+  local script_path="$1"
+  local service_dir="$HOME/.config/systemd/user"
+  mkdir -p "$service_dir"
+
+  cat > "$service_dir/openclaw-watchdog.service" <<EOF
+[Unit]
+Description=OpenClaw Gateway Watchdog
+[Service]
+Type=oneshot
+Environment="GATEWAY_PORT=${GATEWAY_PORT}"
+ExecStart=/usr/bin/bash ${script_path} check
+EOF
+
+  cat > "$service_dir/openclaw-watchdog.timer" <<EOF
+[Unit]
+Description=OpenClaw Gateway Watchdog Timer
+[Timer]
+OnBootSec=120
+OnUnitActiveSec=60
+AccuracySec=10
+[Install]
+WantedBy=timers.target
+EOF
+
+  systemctl --user daemon-reload
+  systemctl --user enable openclaw-watchdog.timer
+  systemctl --user start openclaw-watchdog.timer
+  loginctl enable-linger "$(whoami)" 2>/dev/null || warn "Run 'sudo loginctl enable-linger $(whoami)' for persistence"
+  ok "Watchdog installed (systemd user timer, every 60s)"
   info "View logs: journalctl --user -u openclaw-watchdog.service"
+}
+
+_install_cron() {
+  local script_path="$1"
+  local cron_line="* * * * * GATEWAY_PORT=${GATEWAY_PORT} /usr/bin/bash ${script_path} check >> ${STATE_DIR}/watchdog-cron.log 2>&1"
+  local cron_marker="# openclaw-watchdog"
+
+  # Remove existing watchdog cron entry
+  crontab -l 2>/dev/null | grep -v "$cron_marker" | crontab - 2>/dev/null || true
+
+  # Add new entry
+  (crontab -l 2>/dev/null; echo "${cron_line} ${cron_marker}") | crontab -
+
+  ok "Watchdog installed (cron, every 60s)"
+  ok "Cron entry: ${cron_line}"
+  info "View logs: tail -f ${STATE_DIR}/watchdog-cron.log"
 }
 
 # ============================================================
 # UNINSTALL
 # ============================================================
 cmd_uninstall() {
-  # Try user-level first
+  # Remove cron entry
+  local cron_marker="# openclaw-watchdog"
+  crontab -l 2>/dev/null | grep -v "$cron_marker" | crontab - 2>/dev/null && ok "Cron entry removed" || true
+
+  # Try user-level systemd
   systemctl --user stop openclaw-watchdog.timer 2>/dev/null || true
   systemctl --user disable openclaw-watchdog.timer 2>/dev/null || true
   rm -f "$HOME/.config/systemd/user/openclaw-watchdog.service"
   rm -f "$HOME/.config/systemd/user/openclaw-watchdog.timer"
   systemctl --user daemon-reload 2>/dev/null || true
 
-  # Try system-level
+  # Try system-level systemd
   if [[ $EUID -eq 0 ]]; then
     systemctl stop openclaw-watchdog.timer 2>/dev/null || true
     systemctl disable openclaw-watchdog.timer 2>/dev/null || true
@@ -421,12 +471,13 @@ cmd_status() {
   fi
 
   echo ""
-  # Check timer status
+  # Check timer/cron status
   if systemctl --user is-active openclaw-watchdog.timer >/dev/null 2>&1; then
-    ok "Timer: active (user-level)"
-    systemctl --user status openclaw-watchdog.timer --no-pager 2>/dev/null | head -5
+    ok "Timer: active (systemd user-level)"
   elif systemctl is-active openclaw-watchdog.timer >/dev/null 2>&1; then
-    ok "Timer: active (system-level)"
+    ok "Timer: active (systemd system-level)"
+  elif crontab -l 2>/dev/null | grep -q "openclaw-watchdog"; then
+    ok "Timer: active (cron)"
   else
     warn "Timer: not installed"
   fi
