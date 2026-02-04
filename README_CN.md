@@ -1,5 +1,7 @@
 # Upgrade Guard 🔄
 
+[🇺🇸 English](./README.md)
+
 [![OpenClaw Skill](https://img.shields.io/badge/OpenClaw-Skill-blue)](https://clawdhub.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 [![Version](https://img.shields.io/badge/version-1.0.0-green.svg)](./SKILL.md)
