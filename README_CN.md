@@ -114,10 +114,17 @@ bash scripts/watchdog.sh status
 
 - `bash` 4+, `python3`, `curl`, `git`, `pnpm` 或 `npm`
 
-## 相关项目
+## 🛡️ AI Agent 安全套件
 
-- [config-guard](https://github.com/jzOcb/config-guard) — 配置验证和自动回滚
-- [agent-guardrails](https://github.com/jzOcb/agent-guardrails) — AI agent 代码行为的机械化约束
+| 工具 | 防止什么 |
+|------|---------|
+| **[agent-guardrails](https://github.com/jzOcb/agent-guardrails)** | AI 重写已验证代码、泄露密钥、绕过标准 |
+| **[config-guard](https://github.com/jzOcb/config-guard)** | AI 写错配置、搞崩网关 |
+| **[upgrade-guard](https://github.com/jzOcb/upgrade-guard)** | 版本升级破坏依赖、无法回滚 |
+| **[token-guard](https://github.com/jzOcb/token-guard)** | Token 费用失控、预算超支 |
+| **[process-guardian](https://github.com/jzOcb/process-guardian)** | 后台进程悄悄死掉、无自动恢复 |
+
+📖 **完整故事：** [我审计了自己的 AI agent 系统，发现漏洞百出](https://x.com/xxx111god/status/2019455237048709336)
 
 ## 许可
 
