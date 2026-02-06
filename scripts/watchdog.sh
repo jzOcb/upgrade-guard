@@ -25,11 +25,27 @@ CONFIG_FILE="${CONFIG_FILE:-$HOME/.clawdbot/clawdbot.json}"
 [[ ! -f "$CONFIG_FILE" ]] && CONFIG_FILE="$HOME/.openclaw/openclaw.json"
 STATE_DIR="${STATE_DIR:-$HOME/.openclaw/upgrade-guard}"
 WATCHDOG_STATE="$STATE_DIR/watchdog-state.json"
+METRICS_LOG="$STATE_DIR/watchdog-metrics.jsonl"
 GATEWAY_PORT="${GATEWAY_PORT:-18789}"
 GATEWAY_URL="http://127.0.0.1:${GATEWAY_PORT}"
 FAIL_THRESHOLD="${FAIL_THRESHOLD:-3}"          # consecutive failures before action
 RESTART_TIMEOUT="${RESTART_TIMEOUT:-60}"       # seconds to wait after restart
 UPGRADE_GUARD="$(dirname "$0")/upgrade-guard.sh"
+
+# Resource thresholds
+MEM_WARN_PCT="${MEM_WARN_PCT:-80}"             # warn if system memory > X%
+MEM_CRIT_PCT="${MEM_CRIT_PCT:-90}"             # critical if system memory > X%
+DISK_WARN_PCT="${DISK_WARN_PCT:-80}"           # warn if disk > X%
+DISK_CRIT_PCT="${DISK_CRIT_PCT:-90}"           # critical if disk > X%
+GW_MEM_WARN_MB="${GW_MEM_WARN_MB:-800}"        # warn if gateway RSS > X MB
+GW_MEM_CRIT_MB="${GW_MEM_CRIT_MB:-1200}"       # critical if gateway RSS > X MB
+CHROME_MEM_WARN_MB="${CHROME_MEM_WARN_MB:-1500}"  # warn if Chrome total > X MB
+CHROME_MEM_CRIT_MB="${CHROME_MEM_CRIT_MB:-2000}"  # restart Chrome if > X MB
+METRICS_MAX_LINES="${METRICS_MAX_LINES:-1440}"  # ~24h at 1/min
+
+# Telegram alerts (reads bot token from OpenClaw config)
+ALERT_ENABLED="${ALERT_ENABLED:-true}"
+ALERT_COOLDOWN="${ALERT_COOLDOWN:-300}"         # min seconds between alerts
 
 # Colors
 RED='\033[0;31m'
@@ -74,6 +90,197 @@ with open('$WATCHDOG_STATE', 'w') as f:
 " 2>/dev/null
   else
     echo "{\"$key\": \"$value\"}" > "$WATCHDOG_STATE"
+  fi
+}
+
+# ============================================================
+# Telegram alerts
+# ============================================================
+_get_bot_token() {
+  python3 -c "
+import json
+try:
+    with open('$CONFIG_FILE') as f:
+        print(json.load(f)['channels']['telegram']['botToken'])
+except:
+    print('')
+" 2>/dev/null
+}
+
+_get_chat_id() {
+  python3 -c "
+import json
+try:
+    with open('$CONFIG_FILE') as f:
+        c = json.load(f)['channels']['telegram']
+        print(c.get('allowedUsers',[''])[0])
+except:
+    print('')
+" 2>/dev/null
+}
+
+send_alert() {
+  [[ "$ALERT_ENABLED" != "true" ]] && return 0
+  local message="$1"
+  local level="${2:-WARN}"  # WARN or CRIT
+
+  # Check cooldown
+  local last_alert
+  last_alert=$(get_state "last_alert_time" "0")
+  local now_epoch
+  now_epoch=$(date +%s)
+  if [[ "$last_alert" != "0" ]] && [[ $((now_epoch - last_alert)) -lt "$ALERT_COOLDOWN" ]]; then
+    return 0  # Throttled
+  fi
+
+  local token chat_id
+  token=$(_get_bot_token)
+  chat_id=$(_get_chat_id)
+  [[ -z "$token" || -z "$chat_id" ]] && return 0
+
+  local emoji="⚠️"
+  [[ "$level" == "CRIT" ]] && emoji="🚨"
+
+  local text="${emoji} *Watchdog ${level}*
+${message}
+_$(date -u +%H:%M:%S\ UTC)_"
+
+  curl -sf --max-time 10 \
+    "https://api.telegram.org/bot${token}/sendMessage" \
+    -d chat_id="$chat_id" \
+    -d text="$text" \
+    -d parse_mode="Markdown" \
+    >/dev/null 2>&1 || true
+
+  set_state "last_alert_time" "$now_epoch"
+  log_event "ALERT_${level}" "$message"
+}
+
+# ============================================================
+# Resource monitoring
+# ============================================================
+check_resources() {
+  local warnings=()
+  local criticals=()
+
+  # --- System memory ---
+  local mem_total mem_avail mem_used_pct
+  mem_total=$(awk '/MemTotal/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)
+  mem_avail=$(awk '/MemAvailable/ {print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)
+  if [[ "$mem_total" -gt 0 ]]; then
+    mem_used_pct=$(( (mem_total - mem_avail) * 100 / mem_total ))
+    if [[ "$mem_used_pct" -ge "$MEM_CRIT_PCT" ]]; then
+      criticals+=("RAM ${mem_used_pct}% (${mem_avail}MB free)")
+    elif [[ "$mem_used_pct" -ge "$MEM_WARN_PCT" ]]; then
+      warnings+=("RAM ${mem_used_pct}% (${mem_avail}MB free)")
+    fi
+  fi
+
+  # --- Disk ---
+  local disk_pct
+  disk_pct=$(df / 2>/dev/null | awk 'NR==2 {gsub(/%/,""); print $5}')
+  if [[ -n "$disk_pct" ]]; then
+    if [[ "$disk_pct" -ge "$DISK_CRIT_PCT" ]]; then
+      criticals+=("Disk ${disk_pct}%")
+    elif [[ "$disk_pct" -ge "$DISK_WARN_PCT" ]]; then
+      warnings+=("Disk ${disk_pct}%")
+    fi
+  fi
+
+  # --- Gateway process memory ---
+  local gw_rss_mb=0
+  local gw_pid
+  # Find gateway PID: try multiple patterns
+  gw_pid=$(pgrep -f "openclaw-gateway" 2>/dev/null | head -1 || true)
+  [[ -z "$gw_pid" ]] && gw_pid=$(pgrep -f "clawdbot-gateway" 2>/dev/null | head -1 || true)
+  [[ -z "$gw_pid" ]] && gw_pid=$(ss -tlnp 2>/dev/null | grep ":${GATEWAY_PORT}" | grep -oP 'pid=\K[0-9]+' | head -1 || true)
+  if [[ -n "$gw_pid" ]]; then
+    gw_rss_mb=$(ps -o rss= -p "$gw_pid" 2>/dev/null | awk '{print int($1/1024)}' || echo 0)
+    if [[ "$gw_rss_mb" -ge "$GW_MEM_CRIT_MB" ]]; then
+      criticals+=("Gateway RSS ${gw_rss_mb}MB")
+    elif [[ "$gw_rss_mb" -ge "$GW_MEM_WARN_MB" ]]; then
+      warnings+=("Gateway RSS ${gw_rss_mb}MB")
+    fi
+  fi
+
+  # --- Chrome total memory ---
+  local chrome_mem_mb=0
+  chrome_mem_mb=$(ps aux 2>/dev/null | grep -E "[c]hrome|[c]hromium" | awk '{sum += $6} END {print int(sum/1024)}')
+  chrome_mem_mb=${chrome_mem_mb:-0}
+  if [[ "$chrome_mem_mb" -gt 0 ]]; then
+    if [[ "$chrome_mem_mb" -ge "$CHROME_MEM_CRIT_MB" ]]; then
+      criticals+=("Chrome ${chrome_mem_mb}MB — auto-restarting")
+      restart_chrome
+    elif [[ "$chrome_mem_mb" -ge "$CHROME_MEM_WARN_MB" ]]; then
+      warnings+=("Chrome ${chrome_mem_mb}MB")
+    fi
+  fi
+
+  # --- Record metrics ---
+  local ts
+  ts=$(date +%s)
+  echo "{\"ts\":$ts,\"mem_pct\":${mem_used_pct:-0},\"mem_avail_mb\":${mem_avail:-0},\"disk_pct\":${disk_pct:-0},\"gw_rss_mb\":${gw_rss_mb:-0},\"chrome_mb\":${chrome_mem_mb:-0}}" >> "$METRICS_LOG"
+
+  # Rotate metrics log
+  if [[ -f "$METRICS_LOG" ]]; then
+    local lines
+    lines=$(wc -l < "$METRICS_LOG")
+    if [[ "$lines" -gt "$METRICS_MAX_LINES" ]]; then
+      tail -n "$METRICS_MAX_LINES" "$METRICS_LOG" > "${METRICS_LOG}.tmp"
+      mv "${METRICS_LOG}.tmp" "$METRICS_LOG"
+    fi
+  fi
+
+  # --- Trend detection: memory creep ---
+  if [[ -f "$METRICS_LOG" ]] && [[ $(wc -l < "$METRICS_LOG") -ge 30 ]]; then
+    local mem_30_ago mem_now
+    mem_30_ago=$(head -1 <(tail -30 "$METRICS_LOG") | python3 -c "import sys,json;print(json.load(sys.stdin)['gw_rss_mb'])" 2>/dev/null || echo 0)
+    mem_now=${gw_rss_mb:-0}
+    if [[ "$mem_30_ago" -gt 0 ]] && [[ "$mem_now" -gt 0 ]]; then
+      local growth=$(( (mem_now - mem_30_ago) * 100 / mem_30_ago ))
+      if [[ "$growth" -gt 20 ]]; then
+        warnings+=("Gateway memory growing: ${mem_30_ago}MB → ${mem_now}MB (+${growth}% in 30min)")
+      fi
+    fi
+  fi
+
+  # --- Report ---
+  # Always show resource summary
+  info "Resources: RAM ${mem_used_pct:-?}% | Disk ${disk_pct:-?}% | GW ${gw_rss_mb:-?}MB | Chrome ${chrome_mem_mb:-?}MB"
+  
+  if [[ ${#criticals[@]} -gt 0 ]]; then
+    for c in "${criticals[@]}"; do fail "CRITICAL: $c"; done
+    send_alert "$(printf '%s\n' "${criticals[@]}")" "CRIT"
+    return 2
+  elif [[ ${#warnings[@]} -gt 0 ]]; then
+    for w in "${warnings[@]}"; do warn "WARNING: $w"; done
+    # Only alert on warnings every 30 min
+    local last_warn_alert
+    last_warn_alert=$(get_state "last_warn_alert" "0")
+    local now_epoch
+    now_epoch=$(date +%s)
+    if [[ "$last_warn_alert" == "0" ]] || [[ $((now_epoch - last_warn_alert)) -ge 1800 ]]; then
+      send_alert "$(printf '%s\n' "${warnings[@]}")" "WARN"
+      set_state "last_warn_alert" "$now_epoch"
+    fi
+    return 1
+  fi
+  return 0
+}
+
+# ============================================================
+# Log rotation
+# ============================================================
+rotate_logs() {
+  local logfile="$STATE_DIR/watchdog-cron.log"
+  if [[ -f "$logfile" ]]; then
+    local size
+    size=$(stat -c%s "$logfile" 2>/dev/null || echo 0)
+    # Rotate at 500KB
+    if [[ "$size" -gt 512000 ]]; then
+      mv "$logfile" "${logfile}.1"
+      info "Log rotated (was ${size} bytes)"
+    fi
   fi
 }
 
@@ -124,6 +331,9 @@ cmd_check() {
   local timestamp
   timestamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
+  # Log rotation
+  rotate_logs
+
   # Check 1: Process
   if check_process; then
     ok "Process: running"
@@ -150,6 +360,12 @@ cmd_check() {
     issues+=("telegram_errors")
     # Telegram errors alone don't trigger rollback, just restart
   fi
+
+  # Check 4: Resources (memory, disk, gateway process)
+  check_resources || true
+
+  # Daily cleanup: Chrome sensitive data (cookies, login data, history)
+  clean_chrome_sensitive_data || true
 
   # Update state
   if $healthy; then
@@ -204,6 +420,58 @@ cmd_check() {
   fi
 
   return 1
+}
+
+# ============================================================
+# Chrome management
+# ============================================================
+clean_chrome_sensitive_data() {
+  # Clean cookies, login data, history from Chrome user-data
+  # Run daily to prevent credential accumulation
+  local user_data="$HOME/.openclaw/browser/openclaw/user-data/Default"
+  [[ ! -d "$user_data" ]] && return 0
+  
+  local last_clean
+  last_clean=$(get_state "last_chrome_clean" "0")
+  local now_epoch
+  now_epoch=$(date +%s)
+  
+  # Only clean once per day (86400 seconds)
+  if [[ "$last_clean" != "0" ]] && [[ $((now_epoch - last_clean)) -lt 86400 ]]; then
+    return 0
+  fi
+  
+  info "Cleaning Chrome sensitive data (daily)..."
+  rm -f "$user_data/Cookies"* 2>/dev/null
+  rm -f "$user_data/Login Data"* 2>/dev/null
+  rm -f "$user_data/History"* 2>/dev/null
+  rm -rf "$user_data/Sessions/" 2>/dev/null
+  rm -rf "$user_data/Session Storage/" 2>/dev/null
+  rm -rf "$user_data/Local Storage/" 2>/dev/null
+  rm -rf "$user_data/IndexedDB/" 2>/dev/null
+  
+  set_state "last_chrome_clean" "$now_epoch"
+  log_event "CHROME_CLEAN" "Daily sensitive data cleanup completed"
+  ok "Chrome sensitive data cleaned"
+}
+
+restart_chrome() {
+  info "Restarting Chrome (memory cleanup)..."
+  
+  # Kill all Chrome processes
+  pkill -9 -f "chrome|chromium" 2>/dev/null || true
+  sleep 2
+  
+  # Chrome will be auto-started by OpenClaw browser tool on next use
+  # No need to manually restart — it's lazy-loaded
+  
+  local after_mem
+  after_mem=$(ps aux 2>/dev/null | grep -E "[c]hrome|[c]hromium" | awk '{sum += $6} END {print int(sum/1024)}')
+  after_mem=${after_mem:-0}
+  
+  ok "Chrome restarted (memory: ${after_mem}MB)"
+  log_event "CHROME_RESTART" "Chrome restarted for memory cleanup"
+  send_alert "Chrome restarted (was using too much memory)" "WARN"
 }
 
 # ============================================================
@@ -488,6 +756,21 @@ cmd_status() {
     info "Recent events:"
     tail -10 "$STATE_DIR/watchdog.log"
   fi
+
+  # Show resource trends
+  if [[ -f "$METRICS_LOG" ]]; then
+    local total_points
+    total_points=$(wc -l < "$METRICS_LOG")
+    echo ""
+    info "Metrics: $total_points data points"
+    if [[ "$total_points" -ge 2 ]]; then
+      local latest oldest
+      latest=$(tail -1 "$METRICS_LOG")
+      oldest=$(head -1 "$METRICS_LOG")
+      echo "  Oldest: $(echo "$oldest" | python3 -c "import sys,json;from datetime import datetime;d=json.load(sys.stdin);print(datetime.utcfromtimestamp(d['ts']).strftime('%Y-%m-%d %H:%M UTC'))" 2>/dev/null || echo "?")"
+      echo "  Latest: $(echo "$latest" | python3 -c "import sys,json;d=json.load(sys.stdin);print(f\"RAM {d['mem_pct']}% | Disk {d['disk_pct']}% | GW {d['gw_rss_mb']}MB | Chrome {d.get('chrome_mb',0)}MB\")" 2>/dev/null || echo "?")"
+    fi
+  fi
 }
 
 # ============================================================
@@ -499,23 +782,36 @@ case "${1:-help}" in
   uninstall) cmd_uninstall ;;
   status)    cmd_status ;;
   help|--help|-h)
-    echo "watchdog.sh — OS-level gateway watchdog"
+    echo "watchdog.sh — OS-level gateway watchdog with resource monitoring"
     echo ""
     echo "Commands:"
-    echo "  check      Run health check (process + HTTP + Telegram)"
+    echo "  check      Run health check (process + HTTP + Telegram + resources)"
     echo "  install    Install systemd timer (checks every 60s)"
     echo "  uninstall  Remove systemd timer"
-    echo "  status     Show watchdog state and recent events"
+    echo "  status     Show watchdog state, events, and resource trends"
     echo ""
     echo "Recovery strategy:"
     echo "  Failures 1-2:  Log and wait"
     echo "  Failure 3:     Restart gateway"
     echo "  Failure 6+:    Rollback to last snapshot"
     echo ""
+    echo "Resource monitoring:"
+    echo "  RAM, disk, gateway RSS, Chrome memory tracked every check"
+    echo "  Metrics stored in JSONL (rolling 24h window)"
+    echo "  Trend detection: alerts on memory growth >20% in 30min"
+    echo "  Chrome auto-restart when memory exceeds threshold"
+    echo "  Telegram alerts on WARN and CRIT thresholds"
+    echo ""
     echo "Environment:"
     echo "  GATEWAY_PORT      Gateway port (default: 18789)"
     echo "  FAIL_THRESHOLD    Failures before action (default: 3)"
     echo "  RESTART_TIMEOUT   Seconds to wait after restart (default: 60)"
+    echo "  MEM_WARN_PCT      Memory warning threshold (default: 80)"
+    echo "  DISK_WARN_PCT     Disk warning threshold (default: 80)"
+    echo "  GW_MEM_WARN_MB    Gateway RSS warning (default: 800MB)"
+    echo "  CHROME_MEM_WARN_MB Chrome warning threshold (default: 1500MB)"
+    echo "  CHROME_MEM_CRIT_MB Chrome auto-restart threshold (default: 2000MB)"
+    echo "  ALERT_ENABLED     Send Telegram alerts (default: true)"
     ;;
   *)
     fail "Unknown command: $1"
